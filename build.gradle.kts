@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.mcinablackbox"
-version = "1.0-SNAPSHOT"
+version = "2.0-BETA"
 
 repositories {
     mavenCentral()
