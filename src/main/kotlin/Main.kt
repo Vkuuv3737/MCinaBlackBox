@@ -7,9 +7,10 @@ import io.ktor.client.statement.*
 import okio.FileSystem
 import okio.Path.Companion.toPath
 import okio.Path
-import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.*
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
+import io.ktor.client.plugins.*
 
 val fs = FileSystem.SYSTEM
 var vPath = "none"
@@ -82,7 +83,13 @@ data class ArtifactDetails(
     val size: Long
 )
 
-val client = HttpClient(CIO)
+val client = HttpClient(CIO) {
+    install(HttpTimeout) {
+        requestTimeoutMillis = 30000
+        connectTimeoutMillis = 15000
+        socketTimeoutMillis = 15000
+    }
+}
 val url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 var manifest: VersionManifest? = null
 val json = Json { ignoreUnknownKeys = true }
@@ -112,6 +119,7 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
         val nativesFolder = instanceFolder.div("natives")
         if (!fs.exists(nativesFolder)) fs.createDirectories(nativesFolder)
 
+        println("Downloading: Minecraft Client JAR ($versionId)")
         val jarUrl = versionPkg.downloads.client.url
         val targetFile = instanceFolder.div("$versionId.jar")
         val jarBytes = client.get(jarUrl).readRawBytes()
@@ -121,6 +129,7 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
             val downloads = lib.downloads
             val artifact = downloads.artifact
             if (artifact != null) {
+                println("Downloading Library: ${lib.name}")
                 val libPath = instanceFolder.div("libraries").div(artifact.path)
                 val parentDir = libPath.parent
                 if (parentDir != null && !fs.exists(parentDir)) fs.createDirectories(parentDir)
@@ -136,6 +145,7 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
 
             val nativeArtifact = downloads.classifiers?.get(nativeKey)
             if (nativeArtifact != null) {
+                println("Extracting Natives: ${lib.name}")
                 val nativeBytes = client.get(nativeArtifact.url).readRawBytes()
                 java.util.zip.ZipInputStream(nativeBytes.inputStream()).use { zip ->
                     var entry = zip.nextEntry
@@ -150,6 +160,7 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
             }
         }
 
+        println("Downloading: Asset Index (${versionPkg.assetIndex.id})")
         val assetIndexResponse = client.get(versionPkg.assetIndex.url).bodyAsText()
 
         val indexesDir = instanceFolder.div("assets").div("indexes")
@@ -162,13 +173,13 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
         val virtualDir = instanceFolder.div("assets").div("virtual").div("legacy")
         fs.createDirectories(virtualDir)
 
-        println("--- MCinaBlackBox Resource Mapping ---")
-        println("DO NOT PANIC IF IT LOOKS STUCK")
-
+        println("--- Syncing Assets & Sound Files ---")
         assetManifest.objects.forEach { (name, obj) ->
             val hashPath = "${obj.hash.substring(0, 2)}/${obj.hash}"
             val assetFile = assetsDir.div(hashPath)
+
             if (!fs.exists(assetFile)) {
+                println("Downloading Asset: $name")
                 val parent = assetFile.parent
                 if (parent != null) fs.createDirectories(parent)
                 val assetUrl = "https://resources.download.minecraft.net/$hashPath"
@@ -188,7 +199,63 @@ suspend fun downloadVersion(versionId: String, metadataurl: String) {
 
         println("Sync complete for $versionId.")
     } catch (e: Exception) {
-        println("Error: ${e.message}")
+        println("Error during download: ${e.message}")
+    }
+}
+
+suspend fun mkFabricInstance(versionId: String) {
+    try {
+        val loaderMetaUrl = "https://meta.fabricmc.net/v2/versions/loader/$versionId"
+        val loaderResponse = client.get(loaderMetaUrl).bodyAsText()
+        val metaArray = json.parseToJsonElement(loaderResponse).jsonArray
+
+        if (metaArray.isEmpty()) {
+            println("Error: No Fabric loader found for version $versionId.")
+            return
+        }
+
+        val firstEntry = metaArray[0].jsonObject
+        val loaderVer = firstEntry["loader"]!!.jsonObject["version"]!!.jsonPrimitive.content
+        val intermediaryVer = firstEntry["intermediary"]!!.jsonObject["version"]!!.jsonPrimitive.content
+
+        val instancesDir = vPath.toPath().div("instances")
+        var count = 1
+        var newFolderName = "$versionId-fabric$count"
+        while (fs.exists(instancesDir.div(newFolderName))) {
+            count++
+            newFolderName = "$versionId-fabric$count"
+        }
+
+        val newPath = instancesDir.div(newFolderName)
+        val vanillaPath = instancesDir.div(versionId)
+
+        if (!fs.exists(vanillaPath)) {
+            println("Error: Vanilla version $versionId must be downloaded first.")
+            return
+        }
+
+        fs.createDirectories(newPath)
+        fs.copy(vanillaPath.div("$versionId.jar"), newPath.div("$versionId.jar"))
+
+        val libsFolder = newPath.div("libraries")
+        fs.createDirectories(libsFolder)
+
+        val loaderJarUrl = "https://maven.fabricmc.net/net/fabricmc/fabric-loader/$loaderVer/fabric-loader-$loaderVer.jar"
+        val interJarUrl = "https://maven.fabricmc.net/net/fabricmc/intermediary/$intermediaryVer/intermediary-$intermediaryVer.jar"
+
+        listOf(loaderJarUrl to "fabric-loader.jar", interJarUrl to "intermediary.jar").forEach { (url, name) ->
+            println("Downloading Fabric Component: $name")
+            val bytes = client.get(url).readRawBytes()
+            fs.write(libsFolder.div(name)) { write(bytes) }
+        }
+
+        fs.write(newPath.div("instance_info.txt")) {
+            writeUtf8("net.fabricmc.loader.impl.launch.knot.KnotClient\n$versionId\nPlayer\n4G")
+        }
+
+        println("Instance $newFolderName created and patched.")
+    } catch (e: Exception) {
+        println("Fabric instance creation failed: ${e.message}")
     }
 }
 
@@ -207,35 +274,54 @@ fun updateInstanceSettings(versionId: String, newUser: String? = null, newRam: S
     println("Settings updated for $versionId.")
 }
 
-fun launchGame(versionId: String) {
-    val instancePath = vPath.toPath().div("instances").div(versionId)
-    val gameJar = instancePath.div("$versionId.jar")
-    val libFolder = instancePath.div("libraries")
-    val nativesPath = instancePath.div("natives")
+fun launchGame(instanceId: String) {
+    val instancePath = vPath.toPath().div("instances").div(instanceId)
     val infoFile = instancePath.div("instance_info.txt")
 
-    if (!fs.exists(gameJar)) {
-        println("Error: Instance $versionId not found.")
+    if (!fs.exists(infoFile)) {
+        println("Error: Instance $instanceId not found.")
         return
     }
 
     val infoLines = fs.read(infoFile) { readUtf8() }.lines()
     val mainClass = infoLines[0]
-    val assetIndex = infoLines[1]
+    val versionId = infoLines[1]
     val user = if (infoLines.size > 2) infoLines[2] else "Player"
     val ram = if (infoLines.size > 3) infoLines[3] else "2G"
+
+    val currentJava = System.getProperty("java.version")
+    val javaMajor = if (currentJava.startsWith("1.")) currentJava.split(".")[1].toInt() else currentJava.split(".")[0].split("-")[0].toInt()
+
+    val isLegacy = versionId.contains("1.8") || versionId.contains("1.12")
+
+    if (isLegacy && javaMajor != 8) {
+        println("Error: Legacy version $versionId requires Java 8. Current: Java $javaMajor.")
+        return
+    }
+
+    if (!isLegacy && javaMajor < 17) {
+        println("Error: Modern versions require Java 17+. Current: Java $javaMajor.")
+        return
+    }
+
+    val gameJar = fs.list(instancePath).find { it.name.endsWith(".jar") }
+    val libFolder = instancePath.div("libraries")
+    val nativesPath = instancePath.div("natives")
 
     val libraryFiles = fs.listRecursively(libFolder)
         .filter { it.name.endsWith(".jar") }
         .map { it.toString() }
         .toMutableList()
-    libraryFiles.add(gameJar.toString())
+
+    if (gameJar != null) libraryFiles.add(gameJar.toString())
 
     val sep = if (System.getProperty("os.name").contains("win", ignoreCase = true)) ";" else ":"
 
     val command = listOf(
         "java",
         "-Xmx$ram",
+        "--add-opens", "java.base/java.io=ALL-UNNAMED",
+        "--add-opens", "java.base/java.util=ALL-UNNAMED",
         "-Djava.library.path=${nativesPath.toFile().absolutePath}",
         "-cp", libraryFiles.joinToString(sep),
         mainClass,
@@ -243,14 +329,14 @@ fun launchGame(versionId: String) {
         "--version", versionId,
         "--gameDir", instancePath.toFile().absolutePath,
         "--assetsDir", instancePath.div("assets").toFile().absolutePath,
-        "--assetIndex", assetIndex,
+        "--assetIndex", versionId.substringBeforeLast("."),
         "--uuid", "0",
         "--accessToken", "0",
         "--userType", "legacy"
     )
 
     try {
-        println("Launching $versionId as $user with $ram RAM...")
+        println("Launching $instanceId...")
         ProcessBuilder(command).directory(instancePath.toFile()).inheritIO().start()
     } catch (e: Exception) {
         println("Launch failed: ${e.message}")
@@ -304,11 +390,12 @@ fun printHelp() {
     println("--- MCinaBlackBox CLI Help ---")
     println("fetch               - Updates the version list from Mojang.")
     println("list                - Shows all downloaded Minecraft instances.")
-    println("download <version>  - Downloads a specific version (e.g., download 1.12.2).")
-    println("run <version>       - Launches a downloaded version.")
-    println("delete <version>    - Deletes an instance folder.")
+    println("download <version>  - Downloads a specific version.")
+    println("mkFabricInstance <v>- Creates a new Fabric instance from vanilla.")
+    println("run <instance>      - Launches a downloaded instance.")
+    println("delete <instance>   - Deletes an instance folder.")
     println("setname <ver> <name>- Changes username for an instance.")
-    println("setram <ver> <ram>  - Changes RAM for an instance (e.g., setram 1.12.2 4G).")
+    println("setram <ver> <ram>  - Changes RAM for an instance.")
     println("help                - Shows this command list.")
     println("exit                - Closes the application.")
 }
@@ -331,6 +418,7 @@ fun main() = runBlocking {
                 if (found != null) downloadVersion(found.id, found.url)
                 else println("Version $id not found. Run 'fetch' first.")
             }
+            line.startsWith("mkFabricInstance ") -> mkFabricInstance(line.substringAfter("mkFabricInstance "))
             line.startsWith("run ") -> launchGame(line.substringAfter("run "))
             line.startsWith("delete ") -> deleteInstance(line.substringAfter("delete "))
             line.startsWith("setname ") -> {
@@ -341,7 +429,7 @@ fun main() = runBlocking {
             line.startsWith("setram ") -> {
                 val parts = line.split(" ")
                 if (parts.size == 3) updateInstanceSettings(parts[1], newRam = parts[2])
-                else println("Usage: setram <version> <ram> (e.g. 4G)")
+                else println("Usage: setram <version> <ram>")
             }
             line == "exit" -> break
             else -> println("Unknown command: $line. Type 'help' for commands.")
